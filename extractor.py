@@ -44,27 +44,30 @@ def extract_raw_lines_ocr(pdf_path, tesseract_cmd=None, poppler_path=None):
     return lines
 
 
-def parse_regulatory_lines(lines, config_key="CRR_CCR"):
+def parse_regulatory_lines(lines, config_key="UNIVERSAL_REG"):
     """State machine to parse hierarchy into structured rows."""
-    cfg = CONFIGS.get(config_key, CONFIGS["CRR_CCR"])
+    cfg = CONFIGS.get(config_key, CONFIGS["UNIVERSAL_REG"])
     sec_re = re.compile(cfg["section_regex"])
     sub_re = re.compile(cfg["sub_clause_regex"])
     date_re = re.compile(cfg["date_regex"])
 
     extracted_rows = []
     current_sec = None
-    preamble = ""
     current_sub = None
     current_text_lines = []
     effective_date = ""
 
     def flush_clause():
-        nonlocal current_text_lines, current_sub, current_sec, preamble, effective_date
-        if current_sec and current_sub:
+        nonlocal current_text_lines, current_sub, current_sec, effective_date
+        # Only flush if we actually have a section and text to save
+        if current_sec and current_text_lines:
             full_rule_text = "\n".join(current_text_lines).strip()
+            # Combine Section and Sub-clause for the reference column
+            ref = f"{current_sec} {current_sub}" if current_sub else current_sec
+            
             extracted_rows.append({
                 "Regulation name": cfg["regulation_name"],
-                "Regulatory reference": f"{current_sec} ({current_sub})",
+                "Regulatory reference": ref.strip(),
                 "Rule": full_rule_text,
                 "Published Rule Date": "",
                 "Effective Date": effective_date,
@@ -83,31 +86,28 @@ def parse_regulatory_lines(lines, config_key="CRR_CCR"):
             effective_date = d_match.group(1)
             continue
 
-        # 2. Main Section Header check (e.g. 3.1)
+        # 2. Main Section Header check (e.g., 3.1 or Article 94)
         s_match = sec_re.match(line)
         if s_match:
             flush_clause()
-            current_sec = s_match.group(1)
+            current_sec = s_match.group(1) # Captures "Article 94" or "3.1"
             preamble = s_match.group(2).strip()
             current_sub = None
+            if preamble:
+                current_text_lines = [preamble]
             continue
 
-        # 3. Sub-clause check (e.g. (1), (2))
+        # 3. Sub-clause check (e.g., (1) or 1.)
         sub_match = sub_re.match(line)
         if sub_match:
             flush_clause()
-            current_sub = sub_match.group(1)
+            current_sub = sub_match.group(1) # Captures "(1)" or "1."
             sub_text = sub_match.group(2).strip()
-            
-            # Sub-clause (1) inherits preamble if present
-            if current_sub == "1" and preamble:
-                current_text_lines = [preamble, f"({current_sub}) {sub_text}".strip()]
-            else:
-                current_text_lines = [f"({current_sub}) {sub_text}".strip()]
+            current_text_lines = [f"{current_sub} {sub_text}".strip()]
             continue
 
         # 4. Continuation lines or sub-letters ((a), (b))
-        if current_sub:
+        if current_sec:
             current_text_lines.append(line)
 
     flush_clause()

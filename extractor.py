@@ -1,193 +1,171 @@
+"""
+Universal PRA Rulebook PDF -> Excel extractor.
+
+    python extractor.py input.pdf -o output.xlsx
+    python extractor.py *.pdf -o combined.xlsx --sheet-per-file
+"""
+
+import argparse
 import os
-import re
-import pandas as pd
-import pdfplumber
+import sys
+
 import openpyxl
-from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-from config import CONFIGS
+from openpyxl.cell.rich_text import CellRichText, TextBlock
+from openpyxl.cell.text import InlineFont
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
-try:
-    import pytesseract
-    from pdf2image import convert_from_path
-    OCR_AVAILABLE = True
-except ImportError:
-    OCR_AVAILABLE = False
-
-
-def extract_raw_lines_native(pdf_path):
-    """Extracts text line-by-line using pdfplumber."""
-    lines = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text(layout=False)
-            if text:
-                lines.extend(text.splitlines())
-    return lines
+from config import COLUMNS, STYLE, SPLIT_WORD_THRESHOLD
+from textlayer import document_lines, cover_metadata
+from structure import parse
+from emitter import build_rows
 
 
-def extract_raw_lines_ocr(pdf_path, tesseract_cmd=None, poppler_path=None):
-    """Fallback OCR extractor for scanned PDFs."""
-    if not OCR_AVAILABLE:
-        raise RuntimeError("pytesseract or pdf2image is not installed.")
-    
-    if tesseract_cmd:
-        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
-
-    images = convert_from_path(pdf_path, dpi=300, poppler_path=poppler_path)
-    lines = []
-    custom_config = r'--oem 3 --psm 6'
-    
-    for img in images:
-        text = pytesseract.image_to_string(img, config=custom_config)
-        if text:
-            lines.extend(text.splitlines())
-    return lines
+def extract(pdf_path):
+    meta = cover_metadata(pdf_path)
+    lines = list(document_lines(pdf_path, skip_cover=True))
+    tree = parse(lines, regulation_name=meta.get("part", ""))
+    rows = build_rows(tree, meta)
+    return rows, meta
 
 
-def parse_regulatory_lines(lines, config_key="UNIVERSAL_REG"):
-    """State machine to parse hierarchy into structured rows."""
-    cfg = CONFIGS.get(config_key, CONFIGS["UNIVERSAL_REG"])
-    sec_re = re.compile(cfg["section_regex"])
-    sub_re = re.compile(cfg["sub_clause_regex"])
-    date_re = re.compile(cfg["date_regex"])
+# ---------------------------------------------------------------------------
+# Excel
+# ---------------------------------------------------------------------------
 
-    extracted_rows = []
-    current_sec = None
-    current_sub = None
-    current_text_lines = []
-    effective_date = ""
+def _style_sheet(ws, rows):
+    header_fill = PatternFill("solid", start_color=STYLE["header_fill"],
+                              end_color=STYLE["header_fill"])
+    bau_fill = PatternFill("solid", start_color=STYLE["bau_fill"],
+                           end_color=STYLE["bau_fill"])
+    hname, hsize, hbold, hcolor = STYLE["header_font"]
+    bname, bsize, bbold, bcolor = STYLE["body_font"]
+    gname, gsize, gbold, gcolor = STYLE["heading_font"]
+    header_font = Font(name=hname, size=hsize, bold=hbold, color=hcolor)
+    body_font = Font(name=bname, size=bsize, bold=bbold, color=bcolor)
+    heading_font = Font(name=gname, size=gsize, bold=gbold, color=gcolor)
 
-    def flush_clause():
-        nonlocal current_text_lines, current_sub, current_sec, effective_date
-        # Only flush if we actually have a section and text to save
-        if current_sec and current_text_lines:
-            full_rule_text = "\n".join(current_text_lines).strip()
-            # Combine Section and Sub-clause for the reference column
-            ref = f"{current_sec} {current_sub}" if current_sub else current_sec
-            
-            extracted_rows.append({
-                "Regulation name": cfg["regulation_name"],
-                "Regulatory reference": ref.strip(),
-                "Rule": full_rule_text,
-                "Published Rule Date": "",
-                "Effective Date": effective_date,
-                "BAU Line C": ""
-            })
-            current_text_lines = []
+    side = Side(style="thin", color=STYLE["border"])
+    border = Border(left=side, right=side, top=side, bottom=side)
 
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line:
-            continue
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.border = border
+        cell.alignment = Alignment(horizontal="center", vertical="center",
+                                   wrap_text=True)
+        cell.fill = bau_fill if cell.value == "BAU Line C" else header_fill
 
-        # 1. Effective Date check
-        d_match = date_re.match(line)
-        if d_match:
-            effective_date = d_match.group(1)
-            continue
-
-        # 2. Main Section Header check (e.g., 3.1 or Article 94)
-        s_match = sec_re.match(line)
-        if s_match:
-            flush_clause()
-            current_sec = s_match.group(1) # Captures "Article 94" or "3.1"
-            preamble = s_match.group(2).strip()
-            current_sub = None
-            if preamble:
-                current_text_lines = [preamble]
-            continue
-
-        # 3. Sub-clause check (e.g., (1) or 1.)
-        sub_match = sub_re.match(line)
-        if sub_match:
-            flush_clause()
-            current_sub = sub_match.group(1) # Captures "(1)" or "1."
-            sub_text = sub_match.group(2).strip()
-            current_text_lines = [f"{current_sub} {sub_text}".strip()]
-            continue
-
-        # 4. Continuation lines or sub-letters ((a), (b))
-        if current_sec:
-            current_text_lines.append(line)
-
-    flush_clause()
-    return pd.DataFrame(extracted_rows)
-
-
-def style_excel(output_path):
-    """Applies the exact styling and color scheme to match your template."""
-    wb = openpyxl.load_workbook(output_path)
-    ws = wb.active
-
-    # Palette
-    blue_header_fill = PatternFill(start_color="00AEEF", end_color="00AEEF", fill_type="solid")
-    green_header_fill = PatternFill(start_color="6BA539", end_color="6BA539", fill_type="solid")
-    white_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-    regular_font = Font(name="Calibri", size=10, color="000000")
-    
-    thin_border = Border(
-        left=Side(style='thin', color='BFBFBF'),
-        right=Side(style='thin', color='BFBFBF'),
-        top=Side(style='thin', color='BFBFBF'),
-        bottom=Side(style='thin', color='BFBFBF')
-    )
-
-    # Style Header Row
-    for col_idx, cell in enumerate(ws[1], start=1):
-        cell.font = white_font
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.fill = green_header_fill if cell.value == "BAU Line C" else blue_header_fill
-        cell.border = thin_border
-
-    # Style Data Rows
-    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
-        for cell in row:
-            cell.font = regular_font
-            cell.border = thin_border
+    n_rows = len(rows)
+    for index, excel_row in enumerate(
+            ws.iter_rows(min_row=2, max_row=max(n_rows + 1, 2),
+                         min_col=1, max_col=len(COLUMNS))):
+        is_heading = index < n_rows and rows[index].get("_bold")
+        for cell in excel_row:
+            cell.font = heading_font if is_heading else body_font
+            cell.border = border
             cell.alignment = Alignment(vertical="top", wrap_text=True)
 
-    # Set column widths
-    col_widths = {'A': 18, 'B': 22, 'C': 70, 'D': 20, 'E': 18, 'F': 20}
-    for col_letter, width in col_widths.items():
-        ws.column_dimensions[col_letter].width = width
+    for letter, width in STYLE["widths"].items():
+        ws.column_dimensions[letter].width = width
+    for i in range(len(STYLE["widths"]) + 1, len(COLUMNS) + 1):
+        ws.column_dimensions[get_column_letter(i)].width = 18
 
-    ws.row_dimensions[1].height = 28
+    ws.row_dimensions[1].height = STYLE["header_height"]
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(COLUMNS))}{max(n_rows + 1, 2)}"
+
+
+def _rule_cell(row):
+    """Rule cell value, with the sub-heading run set in bold.
+
+    The sub-heading is not a column -- it sits at the top of the Rule cell, so
+    only that leading run is bolded rather than the whole cell. openpyxl writes
+    this as inline rich text.
+    """
+    text = row.get("Rule", "") or ""
+    subheading = row.get("_subheading", "")
+    if not subheading or not text.startswith(subheading):
+        return text
+
+    name, size, _, color = STYLE["body_font"]
+    bold = InlineFont(rFont=name, sz=size, b=True, color=color)
+    plain = InlineFont(rFont=name, sz=size, color=color)
+    return CellRichText([
+        TextBlock(bold, subheading),
+        TextBlock(plain, text[len(subheading):]),
+    ])
+
+
+def write_excel(sheets, output_path):
+    """sheets: list of (sheet_name, rows)."""
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    rule_col = COLUMNS.index("Rule") + 1 if "Rule" in COLUMNS else None
+
+    for name, rows in sheets:
+        ws = wb.create_sheet(title=name[:31])
+        ws.append(COLUMNS)
+        for row in rows:
+            ws.append([row.get(col, "") for col in COLUMNS])
+        if rule_col:
+            for offset, row in enumerate(rows):
+                if row.get("_subheading"):
+                    ws.cell(offset + 2, rule_col).value = _rule_cell(row)
+        _style_sheet(ws, rows)
+
     wb.save(output_path)
 
 
-def convert_pdf_to_excel(pdf_path, output_excel_path="output.xlsx", use_ocr=False, tesseract_cmd=None, poppler_path=None):
-    print(f"Reading {pdf_path}...")
-    
-    if use_ocr:
-        print("Extracting text via OCR...")
-        lines = extract_raw_lines_ocr(pdf_path, tesseract_cmd, poppler_path)
-    else:
-        print("Extracting native PDF text...")
-        lines = extract_raw_lines_native(pdf_path)
-        if not lines and OCR_AVAILABLE:
-            print("No digital text found. Automatically falling back to OCR...")
-            lines = extract_raw_lines_ocr(pdf_path, tesseract_cmd, poppler_path)
+def _sheet_name(pdf_path):
+    base = os.path.splitext(os.path.basename(pdf_path))[0]
+    for ch in "[]:*?/\\":
+        base = base.replace(ch, " ")
+    return base.replace("__", " ").replace("_", " ").strip()[:31]
 
-    df = parse_regulatory_lines(lines)
-    if df.empty:
-        print("Warning: No matching regulatory rules were found. Check pattern rules in config.py.")
-        return
 
-    df.to_excel(output_excel_path, index=False)
-    style_excel(output_excel_path)
-    print(f"Success! Excel generated at: {output_excel_path}")
+def main():
+    ap = argparse.ArgumentParser(
+        description="Extract PRA Rulebook PDFs into structured Excel.")
+    ap.add_argument("pdfs", nargs="+", help="input PDF file(s)")
+    ap.add_argument("-o", "--output", default="Extracted_Rules.xlsx")
+    ap.add_argument("--sheet-per-file", action="store_true",
+                    help="one worksheet per PDF instead of one combined sheet")
+    ap.add_argument("--threshold", type=int, default=SPLIT_WORD_THRESHOLD,
+                    help="word count above which a sibling group is split")
+    args = ap.parse_args()
+
+    import config
+    config.SPLIT_WORD_THRESHOLD = args.threshold
+    import emitter
+    emitter.SPLIT_WORD_THRESHOLD = args.threshold
+
+    combined = []
+    sheets = []
+
+    for path in args.pdfs:
+        if not os.path.exists(path):
+            print(f"skip (not found): {path}", file=sys.stderr)
+            continue
+        rows, meta = extract(path)
+        print(f"{os.path.basename(path):58s} {len(rows):5d} rows   "
+              f"part={meta.get('part','?')}")
+        if args.sheet_per_file:
+            sheets.append((_sheet_name(path), rows))
+        else:
+            combined.extend(rows)
+
+    if not args.sheet_per_file:
+        sheets = [("Extracted Rules", combined)]
+
+    if not any(rows for _, rows in sheets):
+        print("No rules extracted.", file=sys.stderr)
+        return 1
+
+    write_excel(sheets, args.output)
+    print(f"\nWritten: {args.output}")
+    return 0
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Extract regulatory PDFs to structured Excel format.")
-    parser.add_argument("pdf_path", help="Path to input PDF file")
-    parser.add_argument("-o", "--output", default="Extracted_Rules.xlsx", help="Path to output Excel file")
-    parser.add_argument("--ocr", action="store_true", help="Force OCR extraction")
-    
-    args = parser.parse_args()
-    
-    if os.path.exists(args.pdf_path):
-        convert_pdf_to_excel(args.pdf_path, args.output, use_ocr=args.ocr)
-    else:
-        print(f"Error: File '{args.pdf_path}' not found.")
+    raise SystemExit(main())

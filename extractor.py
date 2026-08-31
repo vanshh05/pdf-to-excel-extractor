@@ -128,7 +128,7 @@ def main():
     ap = argparse.ArgumentParser(
         description="Extract PRA Rulebook PDFs into structured Excel.")
     ap.add_argument("pdfs", nargs="+", help="input PDF file(s)")
-    ap.add_argument("-o", "--output", default="Extracted_Rules.xlsx")
+    ap.add_argument("-o", "--output", default=None)    
     ap.add_argument("--sheet-per-file", action="store_true",
                     help="one worksheet per PDF instead of one combined sheet")
     ap.add_argument("--threshold", type=int, default=SPLIT_WORD_THRESHOLD,
@@ -162,8 +162,9 @@ def main():
         print("No rules extracted.", file=sys.stderr)
         return 1
 
-    write_excel(sheets, args.output)
-    print(f"\nWritten: {args.output}")
+    out = args.output or os.path.splitext(args .pdfs[0])[0] + ".xlsx"   
+    write_excel(sheets, out)
+    print(f"\nWritten: {out}")
     return 0
 
 

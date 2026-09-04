@@ -133,50 +133,50 @@ def _emit(node, depth, container_label, path, meta, rows):
 
 
 def build_rows(root, meta):
-    from structure import walk_containers
-
+    """Walk the tree in document order and emit rows."""
     rows = []
-    seen_chapters = set()
 
-    for chapter, container in walk_containers(root):
-        # Chapter heading row, once, at the point the chapter starts.
-        if ("chapter" in HEADING_ROWS
-                and id(chapter) not in seen_chapters
-                and chapter.title != "(preamble)"
-                and (chapter.label or chapter.title)):
-            seen_chapters.add(id(chapter))
+    for chapter in root.children:
+        if chapter.kind != "chapter":
+            continue
+
+        named = chapter.label or chapter.title
+        if ("chapter" in HEADING_ROWS and named
+                and chapter.title != "(preamble)"):
             rows.append(_heading_row(chapter, meta))
 
-        label = container.label if container is not chapter else ""
-
-        # Article / Section heading row.
-        if (container is not chapter
-                and "container" in HEADING_ROWS
-                and (container.label or container.title)):
-            rows.append(_heading_row(container, meta))
-
-        if container.kind == "container" and not container.children:
-            # Article whose body is unnumbered prose (Article 5, Article 16),
-            # or a Section heading with no body of its own.
-            text = "\n".join([container.own_text()] + container.notes).strip()
-            if text:
-                rows.append(_row(container, label, [], meta, text))
-            continue
-
-        clauses = [c for c in container.children if c.kind == "clause"]
-        if not clauses:
-            continue
-
-        lead = container.own_text()
+        # Text sitting directly under the chapter, before any Article.
+        lead = "\n".join([chapter.own_text()] + chapter.notes).strip()
         if lead:
-            rows.append(_row(container, label, [], meta, lead))
+            rows.append(_row(chapter, "", [], meta, lead))
 
-        if _should_split(clauses, 0):
+        direct = [c for c in chapter.children if c.kind == "clause"]
+        for clause in direct:
+            _emit(clause, 1, "", [clause.label], meta, rows)
+
+        for container in chapter.children:
+            if container.kind != "container":
+                continue
+            label = container.label
+
+            if "container" in HEADING_ROWS and (container.label or container.title):
+                rows.append(_heading_row(container, meta))
+
+            clauses = [c for c in container.children if c.kind == "clause"]
+
+            if not clauses:
+                # Article whose body is unnumbered prose, or a Section heading
+                # with no body of its own.
+                text = "\n".join([container.own_text()] + container.notes).strip()
+                if text:
+                    rows.append(_row(container, label, [], meta, text))
+                continue
+
+            head = container.own_text()
+            if head:
+                rows.append(_row(container, label, [], meta, head))
+
             for clause in clauses:
                 _emit(clause, 1, label, [clause.label], meta, rows)
-        else:
-            text = container.full_text()
-            if text:
-                rows.append(_row(container, label, [], meta, text))
 
     return rows

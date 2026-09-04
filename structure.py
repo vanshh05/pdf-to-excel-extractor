@@ -21,11 +21,11 @@ import re
 
 from config import (
     REGEX, CONTAINER_TOKENS, INDENT_TOL,
-    CHAPTER_SIZE_MIN, CHAPTER_INDENT_MAX, HEADING_INDENT_MAX,
-    SUBHEADING_SIZE_RANGE, SUBHEADING_INDENT, BODY_SIZE, SIZE_TOL,
+    CHAPTER_INDENT_MAX, HEADING_INDENT_MAX,
+    SUBHEADING_INDENT, BODY_SIZE, SIZE_TOL, SIZE_RATIOS,
 )
 from textlayer import is_formula
-from config import FORMULA
+from config import FORMULA, BULLET_CHARS, TABLE
 
 RE_DATE = re.compile(REGEX["date"])
 RE_DOTTED = re.compile(REGEX["marker_dotted"])
@@ -33,6 +33,10 @@ RE_PAREN = re.compile(REGEX["marker_paren"])
 RE_CONTAINER = re.compile(REGEX["container"])
 RE_CHAPTER = re.compile(REGEX["chapter"])
 RE_NOTE = re.compile(REGEX["note"])
+
+
+def _normalise(text):
+    return re.sub(r"\s+", " ", text).strip().lower().rstrip(".")
 
 
 class Node:
@@ -58,14 +62,29 @@ class Node:
         return node
 
     def own_text(self):
-        return " ".join(self.lines).strip()
+        """Join this node's own lines.
+
+        Wrapped prose rejoins with a space, but a bulleted item starts a new
+        line. Bullets carry no (a)/(i) marker, so without this they would run
+        together with the text above them inside the same cell.
+        """
+        out = []
+        for line in self.lines:
+            stripped = line.lstrip()
+            starts_item = (stripped[:1] in BULLET_CHARS
+                           or stripped.startswith(TABLE["placeholder"]))
+            if out and not starts_item:
+                out[-1] = f"{out[-1]} {line}"
+            else:
+                out.append(line)
+        return "\n".join(out).strip()
 
     def full_text(self):
         parts = []
         if self.title:
             parts.append(self.title)
         if self.lines:
-            parts.append(" ".join(self.lines))
+            parts.append(self.own_text())
         for child in self.children:
             head = f"{child.label} " if child.label else ""
             parts.append((head + child.full_text()).strip())
@@ -85,7 +104,14 @@ class Node:
 # ---------------------------------------------------------------------------
 
 def _is_big_heading(line):
-    return line["size"] >= CHAPTER_SIZE_MIN and line["bold"] > 0.8
+    body = line.get("body_size", BODY_SIZE)
+    if line["size"] < body * SIZE_RATIOS["heading_min"] or line["bold"] <= 0.8:
+        return False
+    # SS13/13 sets rule number "5.1" in 14pt bold, the same as its chapter
+    # headings. A line that is nothing but a clause number is a clause.
+    if re.fullmatch(r"\d+[A-Za-z]?(?:\.\d+[A-Za-z]?)?\.?", line["text"].strip()):
+        return False
+    return True
 
 
 def _opens_container(text):
@@ -97,16 +123,18 @@ def _opens_chapter(text):
     return bool(RE_CHAPTER.match(text))
 
 
-def _is_subheading(line):
-    lo, hi = SUBHEADING_SIZE_RANGE
+def _is_subheading(line, margin=None):
+    body = line.get("body_size", BODY_SIZE)
+    lo = body * SIZE_RATIOS["subheading_min"]
+    hi = body * SIZE_RATIOS["heading_min"]
     if line["bold"] < 0.85:
         return False
-    if abs(line["x0"] - SUBHEADING_INDENT) > INDENT_TOL:
+    if margin is not None and line["x0"] < margin - INDENT_TOL:
         return False
     text = line["text"].strip()
     if lo < line["size"] < hi:            # 13.5pt -- unambiguous
         return True
-    if abs(line["size"] - BODY_SIZE) < SIZE_TOL:
+    if abs(line["size"] - body) < SIZE_TOL:
         # 12pt bold at the heading indent is a minor label ("Formula for
         # Method 1"). Body text at this indent is bold only in patches and
         # ends in sentence punctuation, so require neither.
@@ -131,7 +159,12 @@ def _marker(text):
 # Parser
 # ---------------------------------------------------------------------------
 
-def parse(lines, regulation_name=""):
+def parse(lines, regulation_name="", chapter_numbers=None):
+    chapter_numbers = chapter_numbers or {}
+    body_x = [l["x0"] for l in lines
+              if l["size"] < l.get("body_size", BODY_SIZE) * SIZE_RATIOS["heading_min"]]
+    margin = min(body_x) if body_x else None
+
     root = Node("document", title=regulation_name)
     chapter = root.add_child(Node("chapter", label="", title="(preamble)"))
     container = chapter
@@ -171,13 +204,25 @@ def parse(lines, regulation_name=""):
         if (last_heading is not None
                 and _is_big_heading(line)
                 and abs(line["size"] - last_heading["size"]) < SIZE_TOL
-                and not _opens_container(text)
-                and not _opens_chapter(text)):
+                and line["page"] == last_heading["page"]
+                and 0 < line["top"] - last_heading["top"] < line["size"] * 1.8
+                and not _opens_container(text)):
+            # A wrapped title, not a new heading. Proximity decides this rather
+            # than "does the line start with a digit", because a heading can
+            # wrap onto a line that does: "5A Corrections to modified duration
+            # for debt instruments under Article" / "340 of the Market Risk:
+            # Simplified Standardised Approach (CRR) Part".
             last_heading["node"].title = (last_heading["node"].title + " " + text).strip()
+            last_heading["top"] = line["top"]
             continue
 
         # -- chapter heading --------------------------------------------
-        if _is_big_heading(line) and line["x0"] <= CHAPTER_INDENT_MAX:
+        # Chapter vs Article is decided by the LEADING TOKEN, not by indent.
+        # Rulebook parts distinguish them by 6pt of indent (57.9 vs 63.9), but
+        # SS13/13 sets every heading at x=108, so absolute indents do not
+        # transfer. In both document classes an Article/Section/Annex heading
+        # opens with that word and a chapter heading does not.
+        if _is_big_heading(line) and not _opens_container(text):
             close_clauses()
             m = RE_CHAPTER.match(text)
             label, title = (m.group(1), m.group(2)) if m else ("", text)
@@ -189,12 +234,13 @@ def parse(lines, regulation_name=""):
                 Node("chapter", label=label, title=title,
                      indent=line["x0"], page=line["page"]))
             container = chapter
-            last_heading = {"node": chapter, "size": line["size"]}
+            last_heading = {"node": chapter, "size": line["size"],
+                            "page": line["page"], "top": line["top"]}
             pending_subheading = ""
             continue
 
         # -- article / section / annex heading ---------------------------
-        if _is_big_heading(line) and line["x0"] <= HEADING_INDENT_MAX:
+        if _is_big_heading(line):
             close_clauses()
             m = RE_CONTAINER.match(text)
             if m:
@@ -205,14 +251,15 @@ def parse(lines, regulation_name=""):
             container = chapter.add_child(
                 Node("container", label=label, title=title,
                      indent=line["x0"], page=line["page"]))
-            last_heading = {"node": container, "size": line["size"]}
+            last_heading = {"node": container, "size": line["size"],
+                            "page": line["page"], "top": line["top"]}
             pending_subheading = ""
             continue
 
         last_heading = None
 
         # -- sub-heading (requirement 2) ---------------------------------
-        if _is_subheading(line):
+        if _is_subheading(line, margin):
             close_clauses()
             if prev_was_subheading and pending_subheading:
                 pending_subheading = f"{pending_subheading} {text}"
@@ -269,7 +316,55 @@ def parse(lines, regulation_name=""):
         else:
             node.lines.append(text)
 
+    _restore_chapter_numbers(root, chapter_numbers)
     return backfill_dates(root)
+
+
+def _restore_chapter_numbers(root, mapping):
+    """Fill in chapter numbers that the PDF never wrote.
+
+    Word's automatic list numbering is not emitted into the content stream, so
+    headings such as "1 Introduction" arrive as the bare word "Introduction".
+    The Contents page does carry every number, so they are matched back by
+    title. This has to run after parsing rather than during it, because a
+    heading may wrap over two lines ("Material deficiencies in risk capture by
+    an institution's internal" + "approach") and the title is only complete once
+    both have been joined.
+    """
+    if not mapping:
+        return
+
+    # First pass: exact title match.
+    for chapter in root.children:
+        if chapter.kind == "chapter" and not chapter.label:
+            number = mapping.get(_normalise(chapter.title))
+            if number:
+                chapter.label = number
+
+    # Second pass: a heading that wrapped with a gap too large for the
+    # proximity test ("Alternative definitions of sensitivities in the advanced
+    # standardised" / "approach" are 43pt apart, against ~17pt elsewhere). If
+    # joining the two titles produces a Contents entry, they were one heading.
+    children = root.children
+    index = 0
+    while index < len(children) - 1:
+        node, following = children[index], children[index + 1]
+        # A confirmed Contents match is signal enough to merge; the trailing
+        # fragment may already have collected the chapter's clauses.
+        if (node.kind == "chapter" and following.kind == "chapter"
+                and not node.label and not following.label):
+            joined = f"{node.title} {following.title}".strip()
+            number = mapping.get(_normalise(joined))
+            if number:
+                node.label = number
+                node.title = joined
+                node.lines.extend(following.lines)
+                node.notes.extend(following.notes)
+                for child in following.children:
+                    node.add_child(child)
+                children.pop(index + 1)
+                continue
+        index += 1
 
 
 def backfill_dates(node):

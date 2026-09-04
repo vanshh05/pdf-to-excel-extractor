@@ -20,8 +20,20 @@ SPLIT_WORD_THRESHOLD = 300
 # --------------------------------------------------------------------------
 # Typography
 # --------------------------------------------------------------------------
+# Fallback only. The real body size is measured per document -- PRA Rulebook
+# parts set body text at 12pt, but supervisory statements use 11pt, and every
+# threshold below is expressed as a RATIO of the measured size rather than an
+# absolute. Hardcoding 12.0 made "size != BODY_SIZE" true for every single line
+# of an 11pt document, which sent short right-hand fragments to [formula].
 BODY_SIZE = 12.0
 SIZE_TOL = 0.6          # pt tolerance when comparing font sizes
+
+# Multiples of the measured body size.
+SIZE_RATIOS = {
+    "heading_min": 1.20,     # 15.8/12 = 1.32, 16/11 = 1.45
+    "subheading_min": 1.05,  # 13.5/12 = 1.13
+    "script_max": 0.85,      # sub/superscripts
+}
 INDENT_TOL = 2.5        # pt tolerance when comparing left indents
 
 # Heading tiers: (min_size, max_indent, level_name)
@@ -29,10 +41,8 @@ INDENT_TOL = 2.5        # pt tolerance when comparing left indents
 # 15.8pt @ x0~63.9  -> article/section  "Article 325bd Liquidity Horizons"
 # 13.5pt @ x0~63.9  -> sub-heading      "Reduced version of BA-CVA"
 # 12.0pt bold @ x0~63.9 -> sub-heading  "Formula for Method 1"
-CHAPTER_SIZE_MIN = 15.0
 CHAPTER_INDENT_MAX = 60.0        # x0 <= this and big+bold => chapter
 HEADING_INDENT_MAX = 70.0        # x0 <= this and big+bold => article/section
-SUBHEADING_SIZE_RANGE = (12.0, 15.0)
 SUBHEADING_INDENT = 63.9
 
 # Tokens that open an article/section-level container.
@@ -97,12 +107,54 @@ WATERMARK = {
 }
 
 # --------------------------------------------------------------------------
+# Tables
+# --------------------------------------------------------------------------
+# Table content renders as fragments scattered across x positions that are
+# nowhere near the clause indent ladder, so it cannot be parsed as prose and
+# only pollutes the surrounding rule. Every line falling inside a detected
+# table is dropped and replaced by a single placeholder, so the cell still
+# records that a table was there.
+TABLE = {
+    "detect": True,
+    "placeholder": "[Table]",
+}
+
+# --------------------------------------------------------------------------
+# Bullets
+# --------------------------------------------------------------------------
+# Bulleted items carry no (a)/(i) marker, so they would otherwise be folded
+# into the running text of the clause above them. Each one starts a new line
+# inside the same cell instead.
+BULLET_CHARS = "\u2022\u25aa\u25cf\u25e6\u2023\u2043\u00b7\u2010\u2011\u2012\u2013\u2014\u2015"
+
+# --------------------------------------------------------------------------
+# Footnote markers
+# --------------------------------------------------------------------------
+# A superscript footnote reference ("...consolidation entities.1") is a raised
+# digit in a smaller font. Two problems follow if it is left in place: the
+# digit lands in the rule text, and the line now carries two font sizes, which
+# makes the formula heuristic swallow the whole line. Stripped at char level,
+# before any line classification runs.
+FOOTNOTE = {
+    "strip_markers": True,
+    # The footnote block at the foot of the page is dropped as well. On page 4
+    # of SS13/13 it reads "1 On 23 February 2017, this SS was updated - see
+    # appendix for full details. 2 www.bankofengland.co.uk/..." and was landing
+    # in the middle of rule 2.1. It is identified by two conditions together --
+    # set smaller than the body text AND sitting in the bottom band of the page
+    # -- so small print elsewhere on the page is untouched.
+    "drop_block": True,
+    "block_top_ratio": 0.75,  # only in the bottom quarter of the page
+    "max_size_ratio": 0.85,   # marker is at most this share of the body size
+    "min_rise": 0.8,          # and sits at least this many pt above the baseline
+}
+
+# --------------------------------------------------------------------------
 # Formula / table suppression
 # --------------------------------------------------------------------------
 # Formula blocks explode into dozens of fragments at scattered x positions with
 # 8.5pt subscripts and stray glyphs. Left alone they poison the rule text.
 FORMULA = {
-    "subscript_size_max": 10.0,   # sizes below this inside body are sub/superscript
     "glyphs": "∑∏√⎷⎛⎞⎝⎠∣⋅×÷≤≥≠≈±∞ωαβγδσρμΣΠ",
     "placeholder": "[formula]",
     "min_glyph_ratio": 0.12,      # line is a formula if this share is math glyphs
